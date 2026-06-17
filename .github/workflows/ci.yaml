@@ -1,0 +1,84 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+jobs:
+
+  gitleaks:
+    if: github.event_name == 'pull_request'
+    uses: USTBitesHub-v2/ustbite-workflows/.github/workflows/gitleaks.yaml@main
+    with:
+      service_name: "aiops-service"
+    secrets: inherit
+
+  build-pr:
+    needs: gitleaks
+    if: github.event_name == 'pull_request'
+    uses: USTBitesHub-v2/ustbite-workflows/.github/workflows/generate-tag-and-build-image-trivy.yaml@main
+    with:
+      service_name: "aiops-service"
+      service_path: "./"
+    secrets: inherit
+
+  build-push:
+    if: github.event_name == 'push'
+    uses: USTBitesHub-v2/ustbite-workflows/.github/workflows/generate-tag-and-build-image-trivy.yaml@main
+    with:
+      service_name: "aiops-service"
+      service_path: "./"
+    secrets: inherit
+
+  push-image:
+    needs: build-push
+    if: github.event_name == 'push' && needs.build-push.result == 'success' && needs.build-push.outputs.build_result == 'success'
+    uses: USTBitesHub-v2/ustbite-workflows/.github/workflows/push.yaml@main
+    with:
+      service_name: "aiops-service"
+      git_tag: ${{ needs.build-push.outputs.tag }}
+      tag_exists: ${{ needs.build-push.outputs.tag_exists }}
+    secrets: inherit
+
+  prod-gate:
+    needs: push-image
+    if: github.event_name == 'push' && github.ref_name == 'main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - run: echo "Approved for production deployment"
+
+  helm-update:
+    needs: [push-image, prod-gate]
+    if: always() && github.event_name == 'push' && needs.push-image.result == 'success' && (needs.prod-gate.result == 'success' || needs.prod-gate.result == 'skipped')
+    uses: USTBitesHub-v2/ustbite-workflows/.github/workflows/helm-updater-job.yaml@main
+    with:
+      service_name: "aiops-service"
+      image_tag: ${{ needs.push-image.outputs.tag }}
+      target_branch: ${{ github.ref_name }}
+    secrets: inherit
+
+  notify-status:
+    if: always() && github.event_name == 'push'
+    needs: [build-push, push-image, prod-gate, helm-update]
+    uses: USTBitesHub-v2/ustbite-workflows/.github/workflows/notify.yaml@main
+    with:
+      service_name: "aiops-service"
+      git_tag: ${{ needs.push-image.outputs.tag || 'N/A' }}
+      sonarqube_result: "skipped"
+      snyk_result: "skipped"
+      build_result: ${{ needs.build-push.outputs.build_result || 'skipped' }}
+      trivy_result: ${{ needs.build-push.outputs.trivy_result || 'skipped' }}
+      push_result: ${{ needs.push-image.result || 'skipped' }}
+    secrets: inherit
